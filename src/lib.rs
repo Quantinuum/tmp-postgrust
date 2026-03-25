@@ -19,11 +19,12 @@ mod search;
 /// Methods for Synchronous API
 pub mod synchronous;
 
+use std::fmt::Write as FmtWrite;
 use std::fs::{metadata, set_permissions};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::{fs::File, io::Write};
 
 use ctor::dtor;
@@ -45,19 +46,19 @@ pub(crate) static POSTGRES_UID_GID: OnceLock<(Uid, Gid)> = OnceLock::new();
 fn cleanup_static() {
     #[cfg(feature = "tokio-process")]
     if let Some(factory_mutex) = TOKIO_POSTGRES_FACTORY.get() {
-        let mut guard = factory_mutex.blocking_lock();
+        let mut guard = factory_mutex.blocking_write();
         drop(guard.take());
     }
 
     if let Some(factory_mutex) = DEFAULT_POSTGRES_FACTORY.get() {
         let mut guard = factory_mutex
-            .lock()
+            .write()
             .expect("Failed to lock default factory mutex.");
         drop(guard.take());
     }
 }
 
-static DEFAULT_POSTGRES_FACTORY: OnceLock<Mutex<Option<TmpPostgrustFactory>>> = OnceLock::new();
+static DEFAULT_POSTGRES_FACTORY: OnceLock<RwLock<Option<TmpPostgrustFactory>>> = OnceLock::new();
 
 /// Create a new default instance, initializing the `DEFAULT_POSTGRES_FACTORY` if it
 /// does not already exist.
@@ -72,12 +73,12 @@ static DEFAULT_POSTGRES_FACTORY: OnceLock<Mutex<Option<TmpPostgrustFactory>>> = 
 /// is called.
 pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
     let factory_mutex = DEFAULT_POSTGRES_FACTORY.get_or_init(|| {
-        Mutex::new(Some(
+        RwLock::new(Some(
             TmpPostgrustFactory::try_new().expect("Failed to initialize default postgres factory."),
         ))
     });
     let guard = factory_mutex
-        .lock()
+        .read()
         .expect("Failed to lock default factory mutex.");
     let factory = guard
         .as_ref()
@@ -107,10 +108,10 @@ pub fn new_default_process_with_migrations(
             .run_migrations(migrate)
             .expect("Failed to run migrations");
 
-        Mutex::new(Some(factory))
+        RwLock::new(Some(factory))
     });
     let guard = factory_mutex
-        .lock()
+        .read()
         .expect("Failed to lock default factory mutex.");
     let factory = guard
         .as_ref()
@@ -121,7 +122,7 @@ pub fn new_default_process_with_migrations(
 /// Static factory that can be re-used between tests.
 #[cfg(feature = "tokio-process")]
 static TOKIO_POSTGRES_FACTORY: tokio::sync::OnceCell<
-    tokio::sync::Mutex<Option<TmpPostgrustFactory>>,
+    tokio::sync::RwLock<Option<TmpPostgrustFactory>>,
 > = tokio::sync::OnceCell::const_new();
 
 /// Create a new default instance, initializing the `TOKIO_POSTGRES_FACTORY` if it
@@ -141,10 +142,10 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
         .get_or_try_init(|| async {
             TmpPostgrustFactory::try_new_async()
                 .await
-                .map(|factory| tokio::sync::Mutex::new(Some(factory)))
+                .map(|factory| tokio::sync::RwLock::new(Some(factory)))
         })
         .await?;
-    let guard = factory_mutex.lock().await;
+    let guard = factory_mutex.read().await;
     let factory = guard
         .as_ref()
         .expect("Default tokio factory is uninitialized or has been dropped.");
@@ -168,18 +169,21 @@ pub async fn new_default_process_async_with_migrations<F>(
     migrate: F,
 ) -> TmpPostgrustResult<asynchronous::ProcessGuard>
 where
-    F: for<'r> Fn(&'r str) -> futures_util::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    F: for<'r> Fn(
+        &'r str,
+    ) -> futures_util::future::BoxFuture<
+        'r,
+        Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    >,
 {
     let factory_mutex = TOKIO_POSTGRES_FACTORY
         .get_or_try_init(|| async {
             let factory = TmpPostgrustFactory::try_new_async().await?;
-            factory
-                .run_migrations_async(migrate)
-                .await?;
-            Ok(tokio::sync::Mutex::new(Some(factory)))
+            factory.run_migrations_async(migrate).await?;
+            Ok(tokio::sync::RwLock::new(Some(factory)))
         })
         .await?;
-    let guard = factory_mutex.lock().await;
+    let guard = factory_mutex.read().await;
     let factory = guard
         .as_ref()
         .expect("Default tokio factory is uninitialized or has been dropped.");
@@ -204,10 +208,12 @@ impl TmpPostgrustFactory {
         // Disable TCP connections.
         config.push_str("listen_addresses = ''\n");
         // Listen on UNIX socket.
-        config.push_str(&format!(
-            "unix_socket_directories = \'{}\'\n",
+        writeln!(
+            &mut config,
+            "unix_socket_directories = \'{}\'",
             socket_dir.to_str().unwrap()
-        ));
+        )
+        .expect("Failed to append unix socket to config");
 
         config
     }
@@ -313,16 +319,20 @@ impl TmpPostgrustFactory {
     /// Will error if Postgresql is unable to start or if the migrate function returns
     /// an error.
     #[cfg(feature = "tokio-process")]
-    pub async fn run_migrations_async<F>(
-        &self,
-        migrate: F,
-    ) -> TmpPostgrustResult<()>
+    pub async fn run_migrations_async<F>(&self, migrate: F) -> TmpPostgrustResult<()>
     where
-        F: for<'r> Fn(&'r str) -> futures_util::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+        F: for<'r> Fn(
+            &'r str,
+        ) -> futures_util::future::BoxFuture<
+            'r,
+            Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        >,
     {
         let process = self.start_postgresql(&self.cache_dir)?;
 
-        migrate(&process.connection_string()).await.map_err(TmpPostgrustError::MigrationsFailed)?;
+        migrate(&process.connection_string())
+            .await
+            .map_err(TmpPostgrustError::MigrationsFailed)?;
 
         Ok(())
     }
@@ -346,7 +356,7 @@ impl TmpPostgrustFactory {
 
         if !data_directory_path.join("PG_VERSION").exists() {
             return Err(TmpPostgrustError::EmptyDataDirectory);
-        };
+        }
 
         self.start_postgresql(&Arc::new(data_directory))
     }
@@ -417,7 +427,7 @@ impl TmpPostgrustFactory {
 
         if !data_directory_path.join("PG_VERSION").exists() {
             return Err(TmpPostgrustError::EmptyDataDirectory);
-        };
+        }
 
         self.start_postgresql_async(&Arc::new(data_directory)).await
     }
@@ -429,11 +439,6 @@ impl TmpPostgrustFactory {
         dir: &Arc<TempDir>,
     ) -> TmpPostgrustResult<asynchronous::ProcessGuard> {
         use tokio::io::AsyncBufReadExt;
-
-        let process_permit = asynchronous::MAX_CONCURRENT_PROCESSES
-            .acquire()
-            .await
-            .unwrap();
 
         File::create(dir.path().join("postgresql.conf"))
             .map_err(TmpPostgrustError::CreateConfigFailed)?
@@ -471,7 +476,6 @@ impl TmpPostgrustFactory {
             _cache_directory: Arc::clone(&self.cache_dir),
             socket_dir: Arc::clone(&self.socket_dir),
             postgres_process: postgres_process_handle,
-            _process_permit: process_permit,
         })
     }
 }

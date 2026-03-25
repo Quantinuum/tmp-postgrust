@@ -9,7 +9,6 @@ use tempfile::TempDir;
 use tokio::fs::create_dir_all;
 use tokio::io::Lines;
 use tokio::process::{ChildStderr, ChildStdout};
-use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::{
     io::BufReader,
     process::{Child, Command},
@@ -19,9 +18,6 @@ use tracing::{debug, instrument};
 use crate::errors::{ProcessCapture, TmpPostgrustError, TmpPostgrustResult};
 use crate::search::{all_dir_entries, build_copy_dst_path, find_postgresql_command};
 use crate::POSTGRES_UID_GID;
-
-/// Limit the total processes that can be running at any one time.
-pub(crate) static MAX_CONCURRENT_PROCESSES: Semaphore = Semaphore::const_new(8);
 
 #[instrument(skip(command, fail))]
 async fn exec_process(
@@ -94,12 +90,28 @@ pub(crate) async fn exec_copy_dir(src_dir: &Path, dst_dir: &Path) -> TmpPostgrus
             .await
             .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?;
     }
+    let src_dir = src_dir.to_owned();
+    let dst_dir = dst_dir.to_owned();
 
-    for entry in others {
-        reflink_copy::reflink_or_copy(&entry, build_copy_dst_path(&entry, src_dir, dst_dir)?)
+    tokio::task::spawn_blocking(move || {
+        for entry in others {
+            let res = reflink_copy::reflink_or_copy(
+                &entry,
+                build_copy_dst_path(&entry, &src_dir, &dst_dir)?,
+            )
             .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?;
-    }
 
+            if let Some(written) = res {
+                tracing::debug!(
+                    "wasn't able to reflink file, copying instead, {} bytes",
+                    written
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap()?;
     Ok(())
 }
 
@@ -193,8 +205,6 @@ pub struct ProcessGuard {
     /// Socket directory for connection to the running process.
     pub(crate) socket_dir: Arc<TempDir>,
     pub(crate) postgres_process: Child,
-    // Limit the total concurrent processes.
-    pub(crate) _process_permit: SemaphorePermit<'static>,
 }
 
 impl Drop for ProcessGuard {
