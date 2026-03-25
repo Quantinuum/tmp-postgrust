@@ -19,7 +19,7 @@ pub(crate) fn find_postgresql_command(dir: &str, name: &str) -> Result<PathBuf, 
     // Use binaries from $PATH if available.
     if let Ok(path) = which(name) {
         return Ok(path);
-    };
+    }
 
     // Check common install locations for the first available postgresql.
     for path in SEARCH_PATHS {
