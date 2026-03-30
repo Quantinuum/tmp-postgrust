@@ -223,7 +223,7 @@ pub struct TmpPostgrustFactoryConfig {
     /// Disable fsync this will speed up unit tests in exchange for
     /// not guaranteeing that files will be written if postgresql
     /// crashes.
-    disable_fsync: bool,
+    pub disable_fsync: bool,
 }
 
 impl TmpPostgrustFactory {
