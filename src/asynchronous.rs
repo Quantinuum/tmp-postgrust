@@ -95,18 +95,8 @@ pub(crate) async fn exec_copy_dir(src_dir: &Path, dst_dir: &Path) -> TmpPostgrus
 
     tokio::task::spawn_blocking(move || {
         for entry in others {
-            let res = reflink_copy::reflink_or_copy(
-                &entry,
-                build_copy_dst_path(&entry, &src_dir, &dst_dir)?,
-            )
-            .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?;
-
-            if let Some(written) = res {
-                tracing::debug!(
-                    "wasn't able to reflink file, copying instead, {} bytes",
-                    written
-                );
-            }
+            reflink_copy::reflink_or_copy(&entry, build_copy_dst_path(&entry, &src_dir, &dst_dir)?)
+                .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?;
         }
         Ok(())
     })

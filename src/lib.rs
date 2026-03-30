@@ -63,6 +63,8 @@ static DEFAULT_POSTGRES_FACTORY: OnceLock<RwLock<Option<TmpPostgrustFactory>>> =
 /// Create a new default instance, initializing the `DEFAULT_POSTGRES_FACTORY` if it
 /// does not already exist.
 ///
+/// fsync is disabled in the default process.
+///
 /// # Errors
 ///
 /// Will return `Err` if postgres is not installed on system
@@ -74,7 +76,10 @@ static DEFAULT_POSTGRES_FACTORY: OnceLock<RwLock<Option<TmpPostgrustFactory>>> =
 pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
     let factory_mutex = DEFAULT_POSTGRES_FACTORY.get_or_init(|| {
         RwLock::new(Some(
-            TmpPostgrustFactory::try_new().expect("Failed to initialize default postgres factory."),
+            TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
+                disable_fsync: true,
+            })
+            .expect("Failed to initialize default postgres factory."),
         ))
     });
     let guard = factory_mutex
@@ -90,6 +95,8 @@ pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
 /// does not already exist. The function passed as the `migrate` parameters
 /// will be run the first time the factory is initialised.
 ///
+/// fsync is disabled in the default process.
+///
 /// # Errors
 ///
 /// Will return `Err` if postgres is not installed on system
@@ -102,8 +109,10 @@ pub fn new_default_process_with_migrations(
     migrate: impl Fn(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
 ) -> TmpPostgrustResult<synchronous::ProcessGuard> {
     let factory_mutex = DEFAULT_POSTGRES_FACTORY.get_or_init(|| {
-        let factory =
-            TmpPostgrustFactory::try_new().expect("Failed to initialize default postgres factory.");
+        let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
+            disable_fsync: true,
+        })
+        .expect("Failed to initialize default postgres factory.");
         factory
             .run_migrations(migrate)
             .expect("Failed to run migrations");
@@ -128,6 +137,8 @@ static TOKIO_POSTGRES_FACTORY: tokio::sync::OnceCell<
 /// Create a new default instance, initializing the `TOKIO_POSTGRES_FACTORY` if it
 /// does not already exist.
 ///
+/// fsync is disabled in the default process.
+///
 /// # Errors
 ///
 /// Will return `Err` if postgres is not installed on system
@@ -140,9 +151,11 @@ static TOKIO_POSTGRES_FACTORY: tokio::sync::OnceCell<
 pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::ProcessGuard> {
     let factory_mutex = TOKIO_POSTGRES_FACTORY
         .get_or_try_init(|| async {
-            TmpPostgrustFactory::try_new_async()
-                .await
-                .map(|factory| tokio::sync::RwLock::new(Some(factory)))
+            TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
+                disable_fsync: true,
+            })
+            .await
+            .map(|factory| tokio::sync::RwLock::new(Some(factory)))
         })
         .await?;
     let guard = factory_mutex.read().await;
@@ -155,6 +168,8 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
 /// Create a new default instance, initializing the `TOKIO_POSTGRES_FACTORY` if it
 /// does not already exist. The function passed as the `migrate` parameters
 /// will be run the first time the factory is initialised.
+///
+/// fsync is disabled in the default process.
 ///
 /// # Errors
 ///
@@ -178,7 +193,10 @@ where
 {
     let factory_mutex = TOKIO_POSTGRES_FACTORY
         .get_or_try_init(|| async {
-            let factory = TmpPostgrustFactory::try_new_async().await?;
+            let factory = TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
+                disable_fsync: true,
+            })
+            .await?;
             factory.run_migrations_async(migrate).await?;
             Ok(tokio::sync::RwLock::new(Some(factory)))
         })
@@ -199,9 +217,18 @@ pub struct TmpPostgrustFactory {
     next_port: AtomicU32,
 }
 
+/// Configuration for the `TmpPostgrustFactory`.
+#[derive(Default, Debug)]
+pub struct TmpPostgrustFactoryConfig {
+    /// Disable fsync this will speed up unit tests in exchange for
+    /// not guaranteeing that files will be written if postgresql
+    /// crashes.
+    disable_fsync: bool,
+}
+
 impl TmpPostgrustFactory {
     /// Build a Postgresql configuration for temporary databases as a String.
-    fn build_config(socket_dir: &Path) -> String {
+    fn build_config(factory_config: &TmpPostgrustFactoryConfig, socket_dir: &Path) -> String {
         let mut config = String::new();
         // Minimize chance of running out of shared memory
         config.push_str("shared_buffers = '12MB'\n");
@@ -214,13 +241,20 @@ impl TmpPostgrustFactory {
             socket_dir.to_str().unwrap()
         )
         .expect("Failed to append unix socket to config");
+        // Disable fsync this will speed up unit tests in exchange for
+        // not guaranteeing that files will be written if postgresql
+        // crashes.
+        writeln!(&mut config, "fsync = \'{}\'", !factory_config.disable_fsync)
+            .expect("Failed to append fsync option to config");
 
         config
     }
 
     /// Try to create a new factory by creating temporary directories and the necessary config.
     #[instrument]
-    pub fn try_new() -> TmpPostgrustResult<TmpPostgrustFactory> {
+    pub fn try_new(
+        factory_config: &TmpPostgrustFactoryConfig,
+    ) -> TmpPostgrustResult<TmpPostgrustFactory> {
         let socket_dir = Builder::new()
             .prefix("tmp-postgrust-socket")
             .tempdir()
@@ -234,7 +268,7 @@ impl TmpPostgrustFactory {
         synchronous::chown_to_non_root(socket_dir.path())?;
         synchronous::exec_init_db(cache_dir.path())?;
 
-        let config = TmpPostgrustFactory::build_config(socket_dir.path());
+        let config = TmpPostgrustFactory::build_config(factory_config, socket_dir.path());
 
         let factory = TmpPostgrustFactory {
             socket_dir: Arc::new(socket_dir),
@@ -257,7 +291,9 @@ impl TmpPostgrustFactory {
     /// Try to create a new factory by creating temporary directories and the necessary config.
     #[cfg(feature = "tokio-process")]
     #[instrument]
-    pub async fn try_new_async() -> TmpPostgrustResult<TmpPostgrustFactory> {
+    pub async fn try_new_async(
+        factory_config: &TmpPostgrustFactoryConfig,
+    ) -> TmpPostgrustResult<TmpPostgrustFactory> {
         let socket_dir = Builder::new()
             .prefix("tmp-postgrust-socket")
             .tempdir()
@@ -271,7 +307,7 @@ impl TmpPostgrustFactory {
         asynchronous::chown_to_non_root(socket_dir.path()).await?;
         asynchronous::exec_init_db(cache_dir.path()).await?;
 
-        let config = TmpPostgrustFactory::build_config(socket_dir.path());
+        let config = TmpPostgrustFactory::build_config(factory_config, socket_dir.path());
 
         let factory = TmpPostgrustFactory {
             socket_dir: Arc::new(socket_dir),
@@ -490,7 +526,34 @@ mod tests {
 
     #[test(tokio::test)]
     async fn it_works() {
-        let factory = TmpPostgrustFactory::try_new().expect("failed to create factory");
+        let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
+            disable_fsync: false,
+        })
+        .expect("failed to create factory");
+
+        let postgresql_proc = factory
+            .new_instance()
+            .expect("failed to create a new instance");
+
+        let (client, conn) = tokio_postgres::connect(&postgresql_proc.connection_string(), NoTls)
+            .await
+            .expect("failed to connect to postgresql");
+
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                error!("connection error: {}", e);
+            }
+        });
+
+        client.query("SELECT 1;", &[]).await.unwrap();
+    }
+
+    #[test(tokio::test)]
+    async fn it_works_fsync_disabled() {
+        let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
+            disable_fsync: true,
+        })
+        .expect("failed to create factory");
 
         let postgresql_proc = factory
             .new_instance()
@@ -512,9 +575,11 @@ mod tests {
     #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn it_works_async() {
-        let factory = TmpPostgrustFactory::try_new_async()
-            .await
-            .expect("failed to create factory");
+        let factory = TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
+            disable_fsync: false,
+        })
+        .await
+        .expect("failed to create factory");
 
         let postgresql_proc = factory
             .new_instance_async()
@@ -536,7 +601,10 @@ mod tests {
 
     #[test(tokio::test)]
     async fn two_simulatenous_processes() {
-        let factory = TmpPostgrustFactory::try_new().expect("failed to create factory");
+        let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
+            disable_fsync: false,
+        })
+        .expect("failed to create factory");
 
         let proc1 = factory
             .new_instance()
@@ -573,9 +641,11 @@ mod tests {
     #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn two_simulatenous_processes_async() {
-        let factory = TmpPostgrustFactory::try_new_async()
-            .await
-            .expect("failed to create factory");
+        let factory = TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
+            disable_fsync: false,
+        })
+        .await
+        .expect("failed to create factory");
 
         let proc1 = factory
             .new_instance_async()
