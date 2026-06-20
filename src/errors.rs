@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// UTF-8 captures of stdout and stderr for child processes used by the library.
@@ -11,6 +13,7 @@ pub struct ProcessCapture {
 
 /// Error type for possible postgresql errors.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum TmpPostgrustError {
     /// Catchall error for when a subprocess fails to run to completion
     #[error("subprocess failed to execute")]
@@ -64,6 +67,14 @@ pub enum TmpPostgrustError {
     /// Error when running migrations failed.
     #[error("failed to run database migrations")]
     MigrationsFailed(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Error when a required postgres binary cannot be found.
+    #[error("could not find postgres command `{command}`{}", .searched_dir.as_ref().map(|d| format!(" in {}", d.display())).unwrap_or_default())]
+    PostgresCommandNotFound {
+        /// Name of the binary that was not found.
+        command: String,
+        /// The explicit directory that was searched, if one was provided.
+        searched_dir: Option<PathBuf>,
+    },
 }
 
 /// Result type for `TmpPostgrustError`, used by functions in this crate.
