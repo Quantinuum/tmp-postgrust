@@ -5,7 +5,7 @@ use which::which;
 
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
 
-/// Addtional file system locations to search for binaries
+/// Additional file system locations to search for binaries
 /// if `initdb` and `postgres` are not in the $PATH.
 const SEARCH_PATHS: [&str; 5] = [
     "/usr/local/pgsql",
@@ -15,7 +15,25 @@ const SEARCH_PATHS: [&str; 5] = [
     "/opt/local/lib/postgresql*",
 ];
 
-pub(crate) fn find_postgresql_command(dir: &str, name: &str) -> Result<PathBuf, ()> {
+/// Locate a postgres binary by name.
+///
+/// If `bin_dir` is `Some`, only that directory is searched, with no `$PATH` fallback.
+/// If `bin_dir` is `None`, `$PATH` is tried first, then well-known install locations are tried as a fallback.
+pub(crate) fn find_postgresql_command(
+    bin_dir: Option<&Path>,
+    name: &str,
+) -> TmpPostgrustResult<PathBuf> {
+    if let Some(dir) = bin_dir {
+        // N.B. effectively this "." parameter doesn't do anything since we
+        // never pass in any relative paths, only command names.
+        return which::which_in(name, Some(dir), std::path::Path::new(".")).map_err(|_| {
+            TmpPostgrustError::PostgresCommandNotFound {
+                command: name.to_string(),
+                searched_dir: Some(dir.to_owned()),
+            }
+        });
+    }
+
     // Use binaries from $PATH if available.
     if let Ok(path) = which(name) {
         return Ok(path);
@@ -23,7 +41,7 @@ pub(crate) fn find_postgresql_command(dir: &str, name: &str) -> Result<PathBuf, 
 
     // Check common install locations for the first available postgresql.
     for path in SEARCH_PATHS {
-        if let Some(entry) = glob(&(path.to_string() + "/" + dir + "/" + name))
+        if let Some(entry) = glob(&(path.to_string() + "/bin/" + name))
             .expect("Failed to read glob pattern")
             .flatten()
             .next()
@@ -31,7 +49,31 @@ pub(crate) fn find_postgresql_command(dir: &str, name: &str) -> Result<PathBuf, 
             return Ok(entry);
         }
     }
-    Err(())
+
+    Err(TmpPostgrustError::PostgresCommandNotFound {
+        command: name.to_string(),
+        searched_dir: None,
+    })
+}
+
+/// Resolved absolute paths for all postgres binaries the library needs.
+#[derive(Debug)]
+pub(crate) struct PostgresBinaries {
+    pub postgres: PathBuf,
+    pub initdb: PathBuf,
+    pub createdb: PathBuf,
+    pub createuser: PathBuf,
+}
+
+impl PostgresBinaries {
+    pub(crate) fn resolve(bin_dir: Option<&Path>) -> TmpPostgrustResult<Self> {
+        Ok(Self {
+            postgres: find_postgresql_command(bin_dir, "postgres")?,
+            initdb: find_postgresql_command(bin_dir, "initdb")?,
+            createdb: find_postgresql_command(bin_dir, "createdb")?,
+            createuser: find_postgresql_command(bin_dir, "createuser")?,
+        })
+    }
 }
 
 /// Return a tuple of directory paths and other paths in a sub path by recursing through

@@ -16,7 +16,7 @@ use tokio::{
 use tracing::{debug, instrument};
 
 use crate::errors::{ProcessCapture, TmpPostgrustError, TmpPostgrustResult};
-use crate::search::{all_dir_entries, build_copy_dst_path, find_postgresql_command};
+use crate::search::{all_dir_entries, build_copy_dst_path};
 use crate::POSTGRES_UID_GID;
 
 #[instrument(skip(command, fail))]
@@ -49,13 +49,11 @@ async fn exec_process(
 
 #[instrument]
 pub(crate) fn start_postgres_subprocess(
+    postgres_bin: &Path,
     data_directory: &Path,
     port: u32,
 ) -> TmpPostgrustResult<Child> {
-    let postgres_path =
-        find_postgresql_command("bin", "postgres").expect("failed to find postgres");
-
-    let mut command = Command::new(postgres_path);
+    let mut command = Command::new(postgres_bin);
     command
         .env("PGDATA", data_directory.to_str().unwrap())
         .arg("-p")
@@ -69,11 +67,12 @@ pub(crate) fn start_postgres_subprocess(
 }
 
 #[instrument]
-pub(crate) async fn exec_init_db(data_directory: &Path) -> TmpPostgrustResult<()> {
-    let initdb_path = find_postgresql_command("bin", "initdb").expect("failed to find initdb");
-
+pub(crate) async fn exec_init_db(
+    initdb_bin: &Path,
+    data_directory: &Path,
+) -> TmpPostgrustResult<()> {
     debug!("Initializing database in: {:?}", data_directory);
-    let mut command = Command::new(initdb_path);
+    let mut command = Command::new(initdb_bin);
     command
         .env("PGDATA", data_directory.to_str().unwrap())
         .arg("--username=postgres");
@@ -107,12 +106,13 @@ pub(crate) async fn exec_copy_dir(src_dir: &Path, dst_dir: &Path) -> TmpPostgrus
 
 #[instrument]
 pub(crate) async fn exec_create_db(
+    createdb_bin: &Path,
     socket: &Path,
     port: u32,
     owner: &str,
     dbname: &str,
 ) -> TmpPostgrustResult<()> {
-    let mut command = Command::new("createdb");
+    let mut command = Command::new(createdb_bin);
     command
         .arg("-h")
         .arg(socket)
@@ -130,11 +130,12 @@ pub(crate) async fn exec_create_db(
 
 #[instrument]
 pub(crate) async fn exec_create_user(
+    createuser_bin: &Path,
     socket: &Path,
     port: u32,
     username: &str,
 ) -> TmpPostgrustResult<()> {
-    let mut command = Command::new("createuser");
+    let mut command = Command::new(createuser_bin);
     command
         .arg("-h")
         .arg(socket)

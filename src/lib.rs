@@ -22,7 +22,7 @@ pub mod synchronous;
 use std::fmt::Write as FmtWrite;
 use std::fs::{metadata, set_permissions};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::{fs::File, io::Write};
@@ -33,6 +33,7 @@ use tempfile::{Builder, TempDir};
 use tracing::{debug, info, instrument};
 
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
+use crate::search::PostgresBinaries;
 
 const TMP_POSTGRUST_DB_NAME: &str = "tmp-postgrust";
 const TMP_POSTGRUST_USER_NAME: &str = "tmp-postgrust-user";
@@ -78,6 +79,7 @@ pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
         RwLock::new(Some(
             TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
                 disable_fsync: true,
+                ..Default::default()
             })
             .expect("Failed to initialize default postgres factory."),
         ))
@@ -111,6 +113,7 @@ pub fn new_default_process_with_migrations(
     let factory_mutex = DEFAULT_POSTGRES_FACTORY.get_or_init(|| {
         let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
             disable_fsync: true,
+            ..Default::default()
         })
         .expect("Failed to initialize default postgres factory.");
         factory
@@ -153,6 +156,7 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
         .get_or_try_init(|| async {
             TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
                 disable_fsync: true,
+                ..Default::default()
             })
             .await
             .map(|factory| tokio::sync::RwLock::new(Some(factory)))
@@ -195,6 +199,7 @@ where
         .get_or_try_init(|| async {
             let factory = TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
                 disable_fsync: true,
+                ..Default::default()
             })
             .await?;
             factory.run_migrations_async(migrate).await?;
@@ -215,15 +220,21 @@ pub struct TmpPostgrustFactory {
     cache_dir: Arc<TempDir>,
     config: String,
     next_port: AtomicU32,
+    binaries: PostgresBinaries,
 }
 
 /// Configuration for the `TmpPostgrustFactory`.
 #[derive(Default, Debug)]
+#[non_exhaustive]
 pub struct TmpPostgrustFactoryConfig {
     /// Disable fsync this will speed up unit tests in exchange for
     /// not guaranteeing that files will be written if postgresql
     /// crashes.
     pub disable_fsync: bool,
+    /// Directory containing the postgres binaries (`postgres`, `initdb`,
+    /// `createdb`, `createuser`). When `None`, binaries are resolved from
+    /// `$PATH` and common install locations.
+    pub postgresql_bin_dir: Option<PathBuf>,
 }
 
 impl TmpPostgrustFactory {
@@ -255,6 +266,8 @@ impl TmpPostgrustFactory {
     pub fn try_new(
         factory_config: &TmpPostgrustFactoryConfig,
     ) -> TmpPostgrustResult<TmpPostgrustFactory> {
+        let binaries = PostgresBinaries::resolve(factory_config.postgresql_bin_dir.as_deref())?;
+
         let socket_dir = Builder::new()
             .prefix("tmp-postgrust-socket")
             .tempdir()
@@ -266,7 +279,7 @@ impl TmpPostgrustFactory {
 
         synchronous::chown_to_non_root(cache_dir.path())?;
         synchronous::chown_to_non_root(socket_dir.path())?;
-        synchronous::exec_init_db(cache_dir.path())?;
+        synchronous::exec_init_db(&binaries.initdb, cache_dir.path())?;
 
         let config = TmpPostgrustFactory::build_config(factory_config, socket_dir.path());
 
@@ -275,10 +288,17 @@ impl TmpPostgrustFactory {
             cache_dir: Arc::new(cache_dir),
             config,
             next_port: AtomicU32::new(5432),
+            binaries,
         };
         let process = factory.start_postgresql(&factory.cache_dir)?;
-        synchronous::exec_create_user(process.socket_dir.path(), process.port, &process.user_name)?;
+        synchronous::exec_create_user(
+            &factory.binaries.createuser,
+            process.socket_dir.path(),
+            process.port,
+            &process.user_name,
+        )?;
         synchronous::exec_create_db(
+            &factory.binaries.createdb,
             process.socket_dir.path(),
             process.port,
             &process.user_name,
@@ -294,6 +314,8 @@ impl TmpPostgrustFactory {
     pub async fn try_new_async(
         factory_config: &TmpPostgrustFactoryConfig,
     ) -> TmpPostgrustResult<TmpPostgrustFactory> {
+        let binaries = PostgresBinaries::resolve(factory_config.postgresql_bin_dir.as_deref())?;
+
         let socket_dir = Builder::new()
             .prefix("tmp-postgrust-socket")
             .tempdir()
@@ -305,7 +327,7 @@ impl TmpPostgrustFactory {
 
         asynchronous::chown_to_non_root(cache_dir.path()).await?;
         asynchronous::chown_to_non_root(socket_dir.path()).await?;
-        asynchronous::exec_init_db(cache_dir.path()).await?;
+        asynchronous::exec_init_db(&binaries.initdb, cache_dir.path()).await?;
 
         let config = TmpPostgrustFactory::build_config(factory_config, socket_dir.path());
 
@@ -314,11 +336,18 @@ impl TmpPostgrustFactory {
             cache_dir: Arc::new(cache_dir),
             config,
             next_port: AtomicU32::new(5432),
+            binaries,
         };
         let process = factory.start_postgresql_async(&factory.cache_dir).await?;
-        asynchronous::exec_create_user(process.socket_dir.path(), process.port, &process.user_name)
-            .await?;
+        asynchronous::exec_create_user(
+            &factory.binaries.createuser,
+            process.socket_dir.path(),
+            process.port,
+            &process.user_name,
+        )
+        .await?;
         asynchronous::exec_create_db(
+            &factory.binaries.createdb,
             process.socket_dir.path(),
             process.port,
             &process.user_name,
@@ -364,7 +393,7 @@ impl TmpPostgrustFactory {
             Result<(), Box<dyn std::error::Error + Send + Sync>>,
         >,
     {
-        let process = self.start_postgresql(&self.cache_dir)?;
+        let process = self.start_postgresql_async(&self.cache_dir).await?;
 
         migrate(&process.connection_string())
             .await
@@ -412,7 +441,8 @@ impl TmpPostgrustFactory {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         synchronous::chown_to_non_root(dir.path())?;
-        let mut postgres_process_handle = synchronous::start_postgres_subprocess(dir.path(), port)?;
+        let mut postgres_process_handle =
+            synchronous::start_postgres_subprocess(&self.binaries.postgres, dir.path(), port)?;
         let stdout = postgres_process_handle.stdout.take().unwrap();
         let stderr = postgres_process_handle.stderr.take().unwrap();
 
@@ -487,7 +517,7 @@ impl TmpPostgrustFactory {
 
         asynchronous::chown_to_non_root(dir.path()).await?;
         let mut postgres_process_handle =
-            asynchronous::start_postgres_subprocess(dir.path(), port)?;
+            asynchronous::start_postgres_subprocess(&self.binaries.postgres, dir.path(), port)?;
         let stdout = postgres_process_handle.stdout.take().unwrap();
         let stderr = postgres_process_handle.stderr.take().unwrap();
 
@@ -528,6 +558,7 @@ mod tests {
     async fn it_works() {
         let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
             disable_fsync: false,
+            ..Default::default()
         })
         .expect("failed to create factory");
 
@@ -552,6 +583,7 @@ mod tests {
     async fn it_works_fsync_disabled() {
         let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
             disable_fsync: true,
+            ..Default::default()
         })
         .expect("failed to create factory");
 
@@ -577,6 +609,7 @@ mod tests {
     async fn it_works_async() {
         let factory = TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
             disable_fsync: false,
+            ..Default::default()
         })
         .await
         .expect("failed to create factory");
@@ -603,6 +636,7 @@ mod tests {
     async fn two_simulatenous_processes() {
         let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
             disable_fsync: false,
+            ..Default::default()
         })
         .expect("failed to create factory");
 
@@ -643,6 +677,7 @@ mod tests {
     async fn two_simulatenous_processes_async() {
         let factory = TmpPostgrustFactory::try_new_async(&TmpPostgrustFactoryConfig {
             disable_fsync: false,
+            ..Default::default()
         })
         .await
         .expect("failed to create factory");
@@ -755,5 +790,54 @@ mod tests {
 
         // Chance to catch concurrent tests or database that have already been used.
         client.execute("CREATE TABLE lock ();", &[]).await.unwrap();
+    }
+
+    #[test(tokio::test)]
+    async fn explicit_bin_dir_works() {
+        let postgres_path = crate::search::find_postgresql_command(None, "postgres").expect(
+            "cannot derive bin_dir: postgres not found via PATH or known install locations",
+        );
+        let bin_dir = postgres_path
+            .parent()
+            .expect("postgres path has no parent dir")
+            .to_owned();
+
+        let factory = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
+            disable_fsync: true,
+            postgresql_bin_dir: Some(bin_dir),
+        })
+        .expect("failed to create factory with explicit bin dir");
+
+        let proc = factory
+            .new_instance()
+            .expect("failed to create a new instance");
+
+        let (client, conn) = tokio_postgres::connect(&proc.connection_string(), NoTls)
+            .await
+            .expect("failed to connect to postgresql");
+
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                error!("connection error: {}", e);
+            }
+        });
+
+        client.query("SELECT 1;", &[]).await.unwrap();
+    }
+
+    #[test]
+    fn bogus_bin_dir_returns_error() {
+        let result = TmpPostgrustFactory::try_new(&TmpPostgrustFactoryConfig {
+            disable_fsync: true,
+            postgresql_bin_dir: Some(std::path::PathBuf::from("/nonexistent/bin/dir")),
+        });
+        assert!(
+            matches!(
+                result,
+                Err(TmpPostgrustError::PostgresCommandNotFound { .. })
+            ),
+            "expected PostgresCommandNotFound, got: {:?}",
+            result
+        );
     }
 }
