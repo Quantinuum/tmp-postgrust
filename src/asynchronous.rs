@@ -1,14 +1,15 @@
-use nix::sys::signal::{self, Signal};
-use nix::unistd::{Pid, Uid, User};
 use std::convert::TryInto;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use nix::sys::signal::{self, Signal};
+use nix::unistd::{Pid, Uid, User};
 use tempfile::TempDir;
 use tokio::fs::create_dir_all;
 use tokio::io::Lines;
 use tokio::process::{ChildStderr, ChildStdout};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::{
     io::BufReader,
     process::{Child, Command},
@@ -18,6 +19,9 @@ use tracing::{debug, instrument};
 use crate::errors::{ProcessCapture, TmpPostgrustError, TmpPostgrustResult};
 use crate::search::{all_dir_entries, build_copy_dst_path};
 use crate::POSTGRES_UID_GID;
+
+/// Limit the total processes that can be running at any one time.
+pub(crate) static MAX_CONCURRENT_PROCESSES: OnceLock<Semaphore> = OnceLock::new();
 
 #[instrument(skip(command, fail))]
 async fn exec_process(
@@ -196,6 +200,8 @@ pub struct ProcessGuard {
     /// Socket directory for connection to the running process.
     pub(crate) socket_dir: Arc<TempDir>,
     pub(crate) postgres_process: Child,
+    // Limit the total concurrent processes.
+    pub(crate) _process_permit: SemaphorePermit<'static>,
 }
 
 impl Drop for ProcessGuard {

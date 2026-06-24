@@ -75,6 +75,10 @@ pub enum TmpPostgrustError {
         /// The explicit directory that was searched, if one was provided.
         searched_dir: Option<PathBuf>,
     },
+    /// Error when a process permit cannot be acquired for a new postgres subprocess.
+    #[cfg(feature = "tokio-process")]
+    #[error("acquiring process permit failed")]
+    AsyncProcessPermitAcquireError(#[source] tokio::sync::AcquireError),
 }
 
 /// Result type for `TmpPostgrustError`, used by functions in this crate.
