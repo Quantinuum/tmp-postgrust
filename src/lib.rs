@@ -30,10 +30,8 @@ use std::{fs::File, io::Write};
 use ctor::dtor;
 use nix::unistd::{Gid, Uid};
 use tempfile::{Builder, TempDir};
-use tokio::sync::Semaphore;
 use tracing::{debug, info, instrument};
 
-use crate::asynchronous::MAX_CONCURRENT_PROCESSES;
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
 use crate::search::PostgresBinaries;
 
@@ -500,7 +498,7 @@ impl TmpPostgrustFactory {
         self.start_postgresql_async(&Arc::new(data_directory)).await
     }
 
-    // #[cfg(feature = "tokio-process")]
+    #[cfg(feature = "tokio-process")]
     #[instrument(skip(self))]
     async fn start_postgresql_async(
         &self,
@@ -519,8 +517,8 @@ impl TmpPostgrustFactory {
 
         asynchronous::chown_to_non_root(dir.path()).await?;
 
-        let permit = MAX_CONCURRENT_PROCESSES
-            .get_or_init(|| Semaphore::new(num_cpus::get()))
+        let permit = crate::asynchronous::MAX_CONCURRENT_PROCESSES
+            .get_or_init(|| tokio::sync::Semaphore::new(num_cpus::get()))
             .acquire()
             .await
             .map_err(TmpPostgrustError::AsyncProcessPermitAcquireError)?;
