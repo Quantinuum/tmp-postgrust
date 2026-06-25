@@ -303,6 +303,7 @@ impl TmpPostgrustFactory {
             process.port,
             &process.user_name,
             &process.db_name,
+            None,
         )?;
 
         Ok(factory)
@@ -352,6 +353,7 @@ impl TmpPostgrustFactory {
             process.port,
             &process.user_name,
             &process.db_name,
+            None,
         )
         .await?;
 
@@ -467,6 +469,7 @@ impl TmpPostgrustFactory {
             _data_directory: Arc::clone(dir),
             _cache_directory: Arc::clone(&self.cache_dir),
             socket_dir: Arc::clone(&self.socket_dir),
+            createdb_bin: self.binaries.createdb.clone(),
         })
     }
 
@@ -548,6 +551,7 @@ impl TmpPostgrustFactory {
             _data_directory: Arc::clone(dir),
             _cache_directory: Arc::clone(&self.cache_dir),
             socket_dir: Arc::clone(&self.socket_dir),
+            createdb_bin: self.binaries.createdb.clone(),
             postgres_process: postgres_process_handle,
             _process_permit: permit,
         })
