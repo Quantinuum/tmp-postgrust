@@ -3,7 +3,7 @@ use std::fs::create_dir_all;
 use std::io::BufReader;
 use std::io::Lines;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::process::ChildStderr;
 use std::process::ChildStdout;
@@ -125,6 +125,7 @@ pub(crate) fn exec_create_db(
     port: u32,
     owner: &str,
     dbname: &str,
+    template_db: Option<&str>,
 ) -> TmpPostgrustResult<()> {
     let mut command = Command::new(createdb_bin);
     command
@@ -136,8 +137,11 @@ pub(crate) fn exec_create_db(
         .arg("postgres")
         .arg("-O")
         .arg(owner)
-        .arg("--echo")
-        .arg(dbname);
+        .arg("--echo");
+    if let Some(template_db) = template_db {
+        command.arg("-T").arg(template_db);
+    }
+    command.arg(dbname);
     cmd_as_non_root(&mut command);
     exec_process(&mut command, TmpPostgrustError::CreateDBFailed)
 }
@@ -192,6 +196,7 @@ pub struct ProcessGuard {
     pub(crate) _cache_directory: Arc<TempDir>,
     /// Socket directory for connection to the running process.
     pub(crate) socket_dir: Arc<TempDir>,
+    pub(crate) createdb_bin: PathBuf,
 }
 
 impl ProcessGuard {
@@ -202,6 +207,16 @@ impl ProcessGuard {
     /// Panics if a string file path cannot be obtained from the socket directory.
     #[must_use]
     pub fn connection_string(&self) -> String {
+        self.connection_string_for_db(&self.db_name)
+    }
+
+    /// Get a Postgresql format connection string for a database on this running instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a string file path cannot be obtained from the socket directory.
+    #[must_use]
+    pub fn connection_string_for_db(&self, db_name: &str) -> String {
         format!(
             "postgresql:///?host={}&port={}&dbname={}&user={}",
             self.socket_dir
@@ -209,9 +224,28 @@ impl ProcessGuard {
                 .to_str()
                 .expect("Failed to convert socket directory to a path"),
             self.port,
-            self.db_name,
+            db_name,
             self.user_name,
         )
+    }
+
+    /// Clone the current database in this running instance.
+    ///
+    /// The returned connection string points at the newly-created database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `createdb` fails to clone the current database.
+    pub fn clone_database(&self, db_name: &str) -> TmpPostgrustResult<String> {
+        exec_create_db(
+            &self.createdb_bin,
+            self.socket_dir.path(),
+            self.port,
+            &self.user_name,
+            db_name,
+            Some(&self.db_name),
+        )?;
+        Ok(self.connection_string_for_db(db_name))
     }
 }
 
